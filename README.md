@@ -1,7 +1,7 @@
 # CPM-4 — Battery Management System (WIP)
 
 <p align="center">
-  <img src="media/cpm4-hero.png" alt="CPM-4 BMS board" width="900">
+  <img src="media/cpm4.png" alt="CPM-4 BMS board" width="900">
 </p>
 
 This is currently a work in progress. Work is underway on the PCB, firmware will follow.
