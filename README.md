@@ -45,6 +45,8 @@ Current Sensor (Only in advanced mode)
 Aux In 1 (only in advanced mode)
 HV Present
 
+Four temperature sensor inputs
+
 Two pins will be for the high voltage interlock loop if building a high voltage system with multiple boards. 
 
 
