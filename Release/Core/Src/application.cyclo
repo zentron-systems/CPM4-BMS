@@ -1,0 +1,4 @@
+../Core/Src/application.c:223:13:application_slave_take_clean_read	6
+../Core/Src/application.c:875:6:application_setup	10
+../Core/Src/application.c:1057:6:application_loop	159
+../Core/Src/application.c:1933:6:HAL_TIM_PeriodElapsedCallback	13

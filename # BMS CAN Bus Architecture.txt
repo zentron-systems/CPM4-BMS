@@ -1,0 +1,537 @@
+# BMS CAN Bus Architecture
+## Dual FDCAN Design for Multi-Board EV Battery Management
+
+---
+
+## 1. System Overview
+
+Your system has up to **8 boards**, each monitoring **16 cells**, for a maximum of **128 cells** total. Each board has **two FDCAN interfaces**. This document defines what each bus does, what messages flow on it, and exactly how the frames are structured.
+
+### 1.1 The Two Buses
+
+| Property | FDCAN1 — CONTROL BUS | FDCAN2 — INFO BUS |
+|---|---|---|
+| **Purpose** | Everything the EV needs to run safely | Diagnostics, displays, logging, fault-finding |
+| **Speed** | 500 kbit/s (classic CAN) | 500 kbit/s (classic CAN) |
+| **Critical?** | YES — EV cannot drive without it | NO — EV continues to operate if this bus fails |
+| **Who listens** | Motor controller, charger, VCU, thermal management | Dashboard display, data logger, laptop diagnostic tool |
+| **Data** | Pack summary, contactor status, current limits, faults | Individual cell voltages, temperatures, balance status |
+| **Update rate** | 10–100 ms (fast, safety-critical) | 500 ms–2 s (slow, informational) |
+
+### 1.2 Why This Split Works
+
+You were right to be concerned about 128 cell voltages on the control bus. Here's the maths:
+
+Each cell voltage takes 2 bytes. Packing 4 cells per classic CAN frame (8 bytes) means 128 cells = **32 frames** just for voltages. At 500 kbit/s with standard CAN frames (~111 bits each including overhead), that's about 7 ms of bus time per cycle — manageable, but it's **wasted bandwidth on the control bus** because no motor controller or charger cares about individual cell voltages. They only need the pack-level summary: total voltage, min cell, max cell, and current limits.
+
+The control bus carries **condensed pack-level data** — roughly 6–8 frames, sent fast.
+The info bus carries the **detailed per-cell data** — roughly 40+ frames, sent at a relaxed rate.
+
+---
+
+## 2. Physical Topology
+
+```
+                        CONTROL BUS (FDCAN1)
+    ════════════════════════════════════════════════════
+    │         │         │         │              │
+  Board 1  Board 2  Board 3  ... Board 8       VCU / Motor Controller
+  (Master)                                      Charger
+                                                Thermal Management
+
+                         INFO BUS (FDCAN2)
+    ════════════════════════════════════════════════════
+    │         │         │         │              │
+  Board 1  Board 2  Board 3  ... Board 8       Dashboard Display
+  (Master)                                      Data Logger
+                                                OBD/Diagnostic Port
+```
+
+### 2.1 Board Addressing
+
+Each board has a **Board ID** from 0 to 7, set by hardware jumpers (you already have config jumpers — you can add 3 more for board address, or re-use spare pins). Board 0 is the **master** — it's the one connected to the contactors, insulation measurement, and key-start input. It collects data from boards 1–7 over the control bus and produces the pack-level summary messages.
+
+---
+
+## 3. Control Bus (FDCAN1) — Message Protocol
+
+### 3.1 CAN ID Assignment Strategy
+
+Using **standard 11-bit CAN IDs**. The ID number also sets the message priority — lower number = higher priority on the bus. Safety-critical messages get the lowest IDs.
+
+The ID scheme uses a **base + offset** pattern:
+
+```
+Bits [10:8] = Message category (0-7)
+Bits  [7:4] = Message type within category
+Bits  [3:0] = Board ID (0-7) where applicable
+```
+
+### 3.2 Control Bus Message Table
+
+| CAN ID (hex) | Name | Sender | Rate | DLC | Priority |
+|---|---|---|---|---|---|
+| 0x010 | BMS_EMERGENCY | Master | On event | 8 | HIGHEST |
+| 0x020 | BMS_PACK_STATUS | Master | 100 ms | 8 | High |
+| 0x030 | BMS_PACK_VOLTAGE | Master | 100 ms | 8 | High |
+| 0x040 | BMS_CURRENT_LIMITS | Master | 100 ms | 8 | High |
+| 0x050 | BMS_CONTACTOR_STATUS | Master | 200 ms | 8 | Medium |
+| 0x060 | BMS_PACK_TEMPS | Master | 500 ms | 8 | Medium |
+| 0x070 | BMS_SOC_SOH | Master | 1000 ms | 8 | Medium |
+| 0x080 | BMS_INSULATION | Master | 2000 ms | 8 | Low |
+| 0x100 | BMS_CHARGER_COMMAND | Master | 100 ms | 8 | High |
+| 0x1B0+N | BMS_BOARD_HEARTBEAT | Board N | 1000 ms | 8 | Low |
+| 0x600 | VCU_TO_BMS | VCU | 100 ms | 8 | Medium |
+
+### 3.3 Frame Definitions — Control Bus
+
+---
+
+#### 0x010 — BMS_EMERGENCY (sent instantly when a critical fault occurs)
+
+This is the most important message in the entire system. When this frame appears, the motor controller must immediately reduce torque to zero and the charger must stop. It only gets sent when something is dangerously wrong.
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | Emergency code (see table below) | Enum, 1 byte |
+| 1 | Fault source board ID | 0–7 |
+| 2 | Fault cell number (0 if N/A) | 1–16, or 0 |
+| 3 | Fault value high byte | Depends on code |
+| 4 | Fault value low byte | Depends on code |
+| 5 | Pack state flags | Bit field (see below) |
+| 6 | Reserved | 0x00 |
+| 7 | Rolling counter | 0–255, increments each send |
+
+**Emergency codes:**
+
+| Code | Meaning | Fault value = |
+|---|---|---|
+| 0x01 | Cell overvoltage | Cell voltage in mV |
+| 0x02 | Cell undervoltage | Cell voltage in mV |
+| 0x03 | Overtemperature | Temperature in °C (signed) |
+| 0x04 | Undertemperature | Temperature in °C (signed) |
+| 0x05 | Insulation fault | Resistance in MΩ × 10 |
+| 0x06 | Contactor fault | Contactor ID (1=neg, 2=pre, 3=pos) |
+| 0x07 | BQ79616 NFAULT | Board fault register value |
+| 0x08 | Communication loss | Missing board ID |
+| 0x09 | Precharge timeout | Time elapsed in ms |
+| 0x0A | Pack overvoltage | Pack voltage in V × 10 |
+| 0x0B | Pack undervoltage | Pack voltage in V × 10 |
+
+**Pack state flags (byte 5):**
+
+| Bit | Meaning when HIGH |
+|---|---|
+| 0 | Contactors are closed |
+| 1 | Precharge active |
+| 2 | Balancing active |
+| 3 | Charger connected |
+| 4 | NFAULT latched |
+| 5 | Insulation warning |
+| 6 | Thermal derate active |
+| 7 | Reserved |
+
+---
+
+#### 0x020 — BMS_PACK_STATUS (the message every EV controller needs most)
+
+This single frame gives a motor controller or charger everything it needs to know about the pack's health at a glance.
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | BMS state | Enum (see below) |
+| 1 | Pack state flags | Same bit field as emergency byte 5 |
+| 2 | Min cell voltage high | mV, unsigned 16-bit |
+| 3 | Min cell voltage low | (min across all boards) |
+| 4 | Max cell voltage high | mV, unsigned 16-bit |
+| 5 | Max cell voltage low | (max across all boards) |
+| 6 | Number of active boards | 1–8 |
+| 7 | Rolling counter | 0–255 |
+
+**BMS state enum:**
+
+| Value | State | Meaning |
+|---|---|---|
+| 0x00 | INIT | Boards waking up, not ready |
+| 0x01 | STANDBY | All boards OK, contactors open |
+| 0x02 | PRECHARGE | Precharge in progress |
+| 0x03 | RUNNING | Contactors closed, HV bus live |
+| 0x04 | CHARGING | Charger active |
+| 0x05 | BALANCING | Contactors open, balancing cells |
+| 0x06 | FAULT | Critical fault, contactors opening/open |
+| 0x07 | SHUTDOWN | Shutting down |
+
+---
+
+#### 0x030 — BMS_PACK_VOLTAGE
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0–1 | Total pack voltage | V × 10, unsigned 16-bit (e.g., 3520 = 352.0V) |
+| 2–3 | Min cell voltage | mV, unsigned 16-bit |
+| 4–5 | Max cell voltage | mV, unsigned 16-bit |
+| 6–7 | Average cell voltage | mV, unsigned 16-bit |
+
+---
+
+#### 0x040 — BMS_CURRENT_LIMITS (tells motor controller / charger what they're allowed to draw)
+
+This is how the BMS protects the pack. If cells are near OV, charge limit drops to zero. If cells are near UV, discharge limit drops to zero. The motor controller must respect these limits.
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0–1 | Max discharge current | A × 10, unsigned 16-bit |
+| 2–3 | Max charge current | A × 10, unsigned 16-bit |
+| 4–5 | Max discharge power | kW × 10, unsigned 16-bit |
+| 6–7 | Max charge power | kW × 10, unsigned 16-bit |
+
+---
+
+#### 0x050 — BMS_CONTACTOR_STATUS
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | Contactor states | Bit 0=neg, 1=pre, 2=pos (1=closed) |
+| 1 | Contactor faults | Bit 0=neg, 1=pre, 2=pos (1=fault) |
+| 2 | HV bus present (PB14) | 0 or 1 |
+| 3 | Precharge time | ms / 10 (0–2550 ms range) |
+| 4–5 | HV bus voltage | V × 10, unsigned 16-bit |
+| 6 | Key-start signal | 0 or 1 |
+| 7 | Rolling counter | 0–255 |
+
+---
+
+#### 0x060 — BMS_PACK_TEMPS
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | Min battery temp | °C + 40 offset (0 = -40°C, 40 = 0°C, 65 = 25°C) |
+| 1 | Max battery temp | °C + 40 offset |
+| 2 | Average battery temp | °C + 40 offset |
+| 3 | Min balance board temp | °C + 40 offset |
+| 4 | Max balance board temp | °C + 40 offset |
+| 5 | Thermal derate % | 0–100 (100 = no derate, 50 = half power) |
+| 6 | Number of temp sensors | Total across all boards |
+| 7 | Temp fault flags | Bit per board (1 = sensor fault on that board) |
+
+**Why the +40 offset?** It lets you represent -40°C to +215°C in a single unsigned byte. This is standard practice in automotive CAN (SAE J1939 uses the same trick). To decode: real_temp = byte_value - 40.
+
+---
+
+#### 0x070 — BMS_SOC_SOH
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | State of Charge (SOC) | 0–200 in 0.5% steps (100 = 50.0%) |
+| 1 | State of Health (SOH) | 0–200 in 0.5% steps |
+| 2–3 | Energy remaining | Wh, unsigned 16-bit |
+| 4–5 | Total pack capacity | Wh, unsigned 16-bit |
+| 6–7 | Cycle count | Unsigned 16-bit |
+
+---
+
+#### 0x080 — BMS_INSULATION
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0–1 | Insulation resistance | kΩ, unsigned 16-bit (65535 = >65 MΩ, good) |
+| 2 | ISO fault classification | 0=OK, 1=Warning, 2=Fault, 3=Below floor |
+| 3 | ISO measurement valid | 0=measuring, 1=valid |
+| 4–5 | Pack voltage at measurement | V × 10 |
+| 6 | Reserved | 0x00 |
+| 7 | Rolling counter | 0–255 |
+
+---
+
+#### 0x100 — BMS_CHARGER_COMMAND (BMS tells charger what to do)
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | Charge enable | 0=stop, 1=charge allowed |
+| 1–2 | Voltage setpoint | V × 10 (target pack voltage) |
+| 3–4 | Current limit | A × 10 (max charge current right now) |
+| 5 | Charge mode | 0=CC, 1=CV, 2=taper, 3=done |
+| 6 | SOC | 0–200 in 0.5% steps |
+| 7 | Rolling counter | 0–255 |
+
+---
+
+#### 0x1B0 + N — BMS_BOARD_HEARTBEAT (each board sends its own)
+
+Board 0 sends 0x1B0, Board 1 sends 0x1B1, Board 2 sends 0x1B2, etc. The master watches for these. If a heartbeat goes missing for >3 seconds, the master declares a communication fault.
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | Board ID | 0–7 |
+| 1 | Board state | 0=OK, 1=Warning, 2=Fault |
+| 2 | Active cell count | 6–16 |
+| 3 | Board min cell V high | mV, unsigned 16-bit |
+| 4 | Board min cell V low | |
+| 5 | Board max cell V high | mV, unsigned 16-bit |
+| 6 | Board max cell V low | |
+| 7 | Rolling counter | 0–255 |
+
+---
+
+#### 0x600 — VCU_TO_BMS (commands FROM the vehicle control unit TO the BMS)
+
+| Byte | Field | Unit / Encoding |
+|---|---|---|
+| 0 | Command | 0=none, 1=contactor close request, 2=contactor open request |
+| 1 | Charge request | 0=no, 1=please start charging |
+| 2 | Reserved | 0x00 |
+| 3 | Reserved | 0x00 |
+| 4–7 | Reserved | 0x00 |
+
+---
+
+## 4. Info Bus (FDCAN2) — Message Protocol
+
+This bus carries detailed diagnostic data. Nothing on this bus is needed for the EV to drive. If this bus fails completely, the vehicle continues to operate normally.
+
+### 4.1 Info Bus Message Table
+
+| CAN ID (hex) | Name | Sender | Rate | DLC |
+|---|---|---|---|---|
+| 0x200 + N | BOARD_N_CELLS_1_4 | Board N | 1000 ms | 8 |
+| 0x210 + N | BOARD_N_CELLS_5_8 | Board N | 1000 ms | 8 |
+| 0x220 + N | BOARD_N_CELLS_9_12 | Board N | 1000 ms | 8 |
+| 0x230 + N | BOARD_N_CELLS_13_16 | Board N | 1000 ms | 8 |
+| 0x300 + N | BOARD_N_TEMPS | Board N | 2000 ms | 8 |
+| 0x400 + N | BOARD_N_BALANCE | Board N | 2000 ms | 8 |
+| 0x500 + N | BOARD_N_DIAG | Board N | 5000 ms | 8 |
+
+Where N = Board ID (0–7). This means Board 3's cells 1–4 message is CAN ID 0x203.
+
+### 4.2 Frame Definitions — Info Bus
+
+---
+
+#### 0x200 + N — BOARD_N_CELLS_1_4 (4 cell voltages packed into one frame)
+
+Each cell voltage is stored as an **unsigned 16-bit** value in millivolts. With 2 bytes per cell, you fit exactly 4 cells into one 8-byte CAN frame.
+
+| Byte | Field | Unit |
+|---|---|---|
+| 0–1 | Cell 1 voltage | mV, unsigned 16-bit, big-endian |
+| 2–3 | Cell 2 voltage | mV, unsigned 16-bit, big-endian |
+| 4–5 | Cell 3 voltage | mV, unsigned 16-bit, big-endian |
+| 6–7 | Cell 4 voltage | mV, unsigned 16-bit, big-endian |
+
+Cells 5–8 in 0x210+N, cells 9–12 in 0x220+N, cells 13–16 in 0x230+N — same format.
+
+**Bus loading calculation for all cell voltages:**
+8 boards × 4 frames each = 32 frames per cycle.
+At 1000 ms rate, that's 32 frames/second.
+Each classic CAN frame ≈ 111 bits (worst case with bit stuffing).
+32 × 111 = 3,552 bits/second out of 500,000 bits/second = **0.7% bus load**.
+That's absolutely nothing — you have loads of room on the info bus.
+
+---
+
+#### 0x300 + N — BOARD_N_TEMPS
+
+| Byte | Field | Unit |
+|---|---|---|
+| 0 | Battery temp sensor 1 | °C + 40 offset |
+| 1 | Battery temp sensor 2 | °C + 40 offset |
+| 2 | Battery temp sensor 3 | °C + 40 offset |
+| 3 | Battery temp sensor 4 | °C + 40 offset |
+| 4 | Balance board temp | °C + 40 offset |
+| 5 | Temp sensor fault mask | Bit 0–4, 1 = faulty |
+| 6 | Board ID | 0–7 (redundant check) |
+| 7 | Rolling counter | 0–255 |
+
+---
+
+#### 0x400 + N — BOARD_N_BALANCE
+
+| Byte | Field | Unit |
+|---|---|---|
+| 0–1 | Balance target voltage | mV (the floor voltage) |
+| 2 | Balance state | 0=idle, 1=reading, 2=odd, 3=even, 4=done |
+| 3 | Cells currently balancing | Bit field (bits 0–7 = cells 1–8) |
+| 4 | Cells currently balancing | Bit field (bits 0–7 = cells 9–16) |
+| 5 | Cell spread (max−min) | mV, capped at 255 |
+| 6 | Balance thermal stop | 0=OK, 1=stopped (too hot) |
+| 7 | Rolling counter | 0–255 |
+
+---
+
+#### 0x500 + N — BOARD_N_DIAG (detailed diagnostics, sent infrequently)
+
+| Byte | Field | Unit |
+|---|---|---|
+| 0 | BQ79616 fault summary reg | Raw register value |
+| 1 | Communication error count | 0–255 (saturates) |
+| 2 | OV fault flags (cells 9–16) | 1 bit per cell |
+| 3 | OV fault flags (cells 1–8) | 1 bit per cell |
+| 4 | UV fault flags (cells 9–16) | 1 bit per cell |
+| 5 | UV fault flags (cells 1–8) | 1 bit per cell |
+| 6 | Board uptime | Minutes, unsigned 8-bit (wraps at 255) |
+| 7 | Firmware version | Major.Minor packed (high nibble.low nibble) |
+
+---
+
+## 5. Control Bus Loading Analysis
+
+This is the critical check — the control bus must never get overloaded.
+
+| Message | Size (bits) | Rate | Bits/sec |
+|---|---|---|---|
+| BMS_EMERGENCY | 111 | On event (rare) | ~0 |
+| BMS_PACK_STATUS | 111 | 10 Hz | 1,110 |
+| BMS_PACK_VOLTAGE | 111 | 10 Hz | 1,110 |
+| BMS_CURRENT_LIMITS | 111 | 10 Hz | 1,110 |
+| BMS_CONTACTOR_STATUS | 111 | 5 Hz | 555 |
+| BMS_PACK_TEMPS | 111 | 2 Hz | 222 |
+| BMS_SOC_SOH | 111 | 1 Hz | 111 |
+| BMS_INSULATION | 111 | 0.5 Hz | 56 |
+| BMS_CHARGER_COMMAND | 111 | 10 Hz | 1,110 |
+| 8 × BOARD_HEARTBEAT | 111 | 8 × 1 Hz | 888 |
+| VCU_TO_BMS | 111 | 10 Hz | 1,110 |
+| **TOTAL** | | | **~7,400** |
+
+**7,400 bits/second ÷ 500,000 bits/second = 1.5% bus load.**
+
+That's excellent. The industry rule of thumb is to keep CAN bus load below 30% for reliable real-time operation. You're at 1.5%, so you have enormous headroom even if you add more nodes later (thermal management controller, DC-DC converter, power steering pump, etc.).
+
+---
+
+## 6. Multi-Board Communication Flow
+
+### 6.1 How Board 0 (Master) Collects Data from Boards 1–7
+
+The boards are physically wired in a BQ79616 daisy chain for cell monitoring, but on the CAN bus they're all peers. The master doesn't need to poll — each board transmits its heartbeat and cell data independently.
+
+**Master's job on the control bus:**
+1. Listen for heartbeats from boards 1–7 (timeout = 3 seconds)
+2. Track min/max cell voltage and temperature across all boards
+3. Calculate pack total voltage (sum of all board voltages)
+4. Produce the pack-level summary messages (0x020–0x080)
+5. Handle contactor control (only master has contactor hardware)
+
+**Each slave board's job on the control bus:**
+1. Send its heartbeat every 1 second (0x1B0 + board_id)
+2. Listen for emergency messages (if master declares emergency, slaves stop balancing)
+
+**Every board's job on the info bus:**
+1. Send its 4 cell voltage frames every 1 second
+2. Send its temperature frame every 2 seconds
+3. Send its balance status every 2 seconds
+4. Send its diagnostic frame every 5 seconds
+
+### 6.2 Startup Sequence Over CAN
+
+```
+Time    Event
+────    ─────────────────────────────────────────────────
+  0 ms  All boards power on, initialise BQ79616
+        Each board starts sending heartbeats on control bus
+        Master sends BMS_PACK_STATUS with state = INIT
+
+ ~2 s   Master has received heartbeats from all expected boards
+        Master sends BMS_PACK_STATUS with state = STANDBY
+
+        VCU sends VCU_TO_BMS with contactor close request
+
+        Master checks: all boards OK? Min/max voltages safe?
+        If yes: Master runs contactor startup sequence
+        Master sends BMS_PACK_STATUS with state = PRECHARGE
+        Master sends BMS_CONTACTOR_STATUS showing precharge active
+
+ ~3 s   Precharge complete (PB14 goes HIGH)
+        Master closes positive contactor
+        Master sends BMS_PACK_STATUS with state = RUNNING
+        
+        EV is now driveable
+```
+
+---
+
+## 7. Rolling Counter and Message Validation
+
+Every message has a rolling counter in its last byte. This is a simple but effective way for receivers to detect:
+
+1. **Stale data** — if the counter hasn't changed, the message hasn't been updated
+2. **Lost messages** — if the counter jumps by more than 1, a message was missed
+3. **Stuck transmitter** — if the counter stops incrementing, the sender may have crashed
+
+The counter increments 0 → 1 → 2 → ... → 255 → 0 (wraps around). The receiver checks that each new message has counter = (previous_counter + 1) mod 256. If it doesn't match for 3 consecutive misses, the receiver should flag a communication warning.
+
+---
+
+## 8. Fault Escalation Strategy
+
+```
+Level 0: INFO         → Info bus only (cell voltage drift, minor temp rise)
+                        No action needed, just logged
+
+Level 1: WARNING      → Control bus BMS_PACK_STATUS flags change
+                        Current limits reduced (thermal derate)
+                        VCU may display warning light
+
+Level 2: FAULT        → BMS_EMERGENCY sent on control bus
+                        Contactors opened
+                        Motor controller must torque to zero
+                        Charger must stop
+
+Level 3: LATCHED      → Same as FAULT but requires power cycle
+                        NFAULT tripped, hardware protection active
+```
+
+---
+
+## 9. FDCAN Hardware Configuration
+
+Your current CubeMX FDCAN init uses classic CAN at what looks like a very high baud rate (the prescaler and segment values need adjustment). Here's what the configuration should be for **500 kbit/s classic CAN**, which is the standard EV rate:
+
+**For an STM32G0 with a 64 MHz FDCAN kernel clock:**
+
+```
+Prescaler        = 8
+TimeSeg1 (BS1)   = 13
+TimeSeg2 (BS2)   = 2
+SyncJumpWidth    = 2
+
+Calculation: 64 MHz ÷ 8 = 8 MHz time quantum
+             Bit time = 1 + 13 + 2 = 16 time quanta
+             Baud rate = 8 MHz ÷ 16 = 500 kbit/s
+             Sample point = (1 + 13) / 16 = 87.5%
+```
+
+The 87.5% sample point is ideal for automotive CAN — it matches what all car manufacturers use and gives good noise immunity.
+
+---
+
+## 10. Implementation Priority
+
+I'd recommend implementing in this order:
+
+1. **Board heartbeat** (0x1B0+N) — simplest message, proves the bus works
+2. **Pack status** (0x020) — the single most useful message for testing
+3. **Pack voltage** (0x030) — needed for any driving
+4. **Current limits** (0x040) — needed for motor controller integration
+5. **Contactor status** (0x050) — needed for safe startup/shutdown
+6. **Cell voltages on info bus** (0x200+N) — needed for display/logging
+7. **Emergency** (0x010) — needed before the car moves
+8. **Everything else** — temperatures, balancing, SOC, charger, diagnostics
+
+---
+
+## 11. What Other EV Systems Will Want From You
+
+When you eventually connect a motor controller, charger, or VCU, here's what each expects:
+
+| Device | Needs from BMS | Uses message |
+|---|---|---|
+| Motor controller | "Can I draw current?" + "How much?" | 0x040 (current limits) |
+| Motor controller | "Is the HV bus live?" | 0x050 (contactor status) |
+| Motor controller | "Stop immediately!" | 0x010 (emergency) |
+| Charger | "What voltage and current to use" | 0x100 (charger command) |
+| Charger | "Stop charging" | 0x100 byte 0 = 0 |
+| VCU | "Pack health overview" | 0x020 (pack status) |
+| VCU | "Battery range estimate" | 0x070 (SOC) |
+| Dashboard | "Battery percentage" | 0x070 (SOC) on info bus mirror, or directly |
+| Thermal system | "Battery temperature" | 0x060 (pack temps) |
+| Data logger | "Everything" | Listens to both buses |
